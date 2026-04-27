@@ -1,0 +1,126 @@
+input {
+  kafka {
+    bootstrap_servers => "kf01-A.m05.netmagicians.com:9092,kf01-B.m05.netmagicians.com:9092,kf01-C.m05.netmagicians.com:9092"
+    topics => ["topic03"]
+    client_id => "indexer-node03-topic3"
+    consumer_threads => 3
+    enable_auto_commit => true
+    group_id => "indexer-group03-elastic"
+  }
+}
+
+filter {
+  grok {
+    match => { "message" => "\[%{DATA:perftype}\]" }
+  }
+
+  mutate {
+    gsub => [ "message", "[\[\]]", "" ]
+  }
+
+  if [perftype] == "SERVICEPERFDATA" {
+    grok {
+      patterns_dir => ["/usr/share/logstash/modules/nagios"]
+      match => { "message" => "%{SERVICE_PERF_DATA}" }
+    }
+  } else if [perftype] == "HOSTPERFDATA" {
+    grok {
+      patterns_dir => ["/usr/share/logstash/modules/nagios"]
+      match => { "message" => "%{HOST_PERF_DATA}" }
+    }
+    mutate {
+      add_field => { "service_display_name" => "Ping Check" }
+    }
+  }
+
+  grok {
+    patterns_dir => ["/usr/share/logstash/modules/nagios"]
+    match => { "service_display_name" => "%{MEASURMENT_DELIMITER}" }
+  }
+
+  # Split hostname
+  mutate {
+    add_field => { "hostname_token" => "%{aliasid}" }
+  }
+
+  mutate {
+    split => ["hostname_token", "-"]
+    add_field => {
+      "customer" => "%{[hostname_token][0]}"
+      "ip" => "%{[hostname_token][-1]}"
+    }
+    remove_field => ["hostname_token"]
+  }
+
+  mutate {
+    add_field => { "hostalias" => "%{aliasname},%{aliasid}" }
+  }
+
+  date {
+    match => ["nagios_timestamp", "UNIX"]
+    target => "@timestamp"
+  }
+
+  if [nagios_performance] and [nagios_performance] != "" {
+    ruby {
+      code => "
+        nagios_event = event.get('nagios_performance')
+        attrs = ['warn','crit','min','max']
+        perfdata = {}
+
+        fields = nagios_event.split
+
+        fields.each_with_index do |field, i|
+          if field.include? '='
+            sub = field.split('=')
+            val = sub[1]
+            values = val.split(';')
+            current = values[0]
+
+            match = /([\\.,0-9]+)([a-zA-Z%]+)/.match(current)
+            field_cur = 'perfdata#'+sub[0]+'#cur'
+            field_uom = 'perfdata#'+sub[0]+'#uom'
+
+            if match and match.length == 3
+              res = match[1].tr(',', '.')
+              event.set(field_uom, match[2])
+              begin
+                event.set(field_cur, Float(res))
+              rescue
+                event.set(field_cur, 0.0)
+              end
+            else
+              res = current.include?(',') ? current.tr(',', '.') : current
+              begin
+                event.set(field_cur, Float(res))
+              rescue
+                event.set(field_cur, 0.0)
+              end
+            end
+          end
+        end
+      "
+    }
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => [
+      "http://103.19.52.64:9200",
+      "http://103.19.52.65:9200"
+    ]
+
+    # 🔥 CRITICAL — USE ALIAS (ILM)
+    index => "logs-write"
+
+    retry_max_interval => 128
+    timeout => 300
+
+    # Recommended
+    manage_template => false
+  }
+
+  # Optional debugging (can remove later)
+  # stdout { codec => rubydebug }
+}
